@@ -1,6 +1,42 @@
-# Neo4j backed Agentic System
+# Neo4j-backed Agentic System
+
+Below describes a v0.1 of idea of an agentic system backed by Neo4j. 
+
+## Advantages of Graph-Based Agent Systems
 
 
+## 1. Flexible Agent Relationships
+- **Dynamic topology**: Agent relationships can evolve and reconfigure at runtime
+- **Complex workflows**: Easily represent multi-step, conditional agent interactions
+- **Specialization**: Agents can focus on specific tasks while maintaining connections to other capabilities
+
+## 2. Rich Context and Memory
+- **Contextual awareness**: Access to structured, interconnected knowledge
+- **Relationship-based reasoning**: Understand how information relates, not just the information itself
+- **Memory management**: Automatic summarization and organization of stored information
+- **Historical context**: Maintain and reference execution history for learning
+
+## 3. Improved Reasoning Capabilities
+- **Graph-based inference**: Leverage graph algorithms for reasoning
+- **Path finding**: Discover connections between concepts that might not be obvious
+- **Relationship traversal**: Follow chains of reasoning through explicit relationships
+
+## 4. System Introspection
+- **Self-modification**: The system can analyze and modify its own structure
+- **Runtime debugging**: Observe exactly how information flows between components
+- **Execution tracing**: Complete visibility into the decision-making process
+
+## 5. Operational Benefits
+- **Persistence**: State is automatically preserved between sessions
+- **Scalability**: Graph databases scale well for complex relationship networks
+- **Monitoring**: Built-in ability to analyze performance and behavior patterns
+- **Resilience**: Distributed nature helps prevent single points of failure
+
+## 6. Development Advantages
+- **Modular design**: Easy to add new agent types, tools, or memory structures
+- **Visual representation**: Graph databases provide intuitive visualization of the system
+- **Query capabilities**: Powerful querying for complex system analysis
+- **Extensibility**: Foundation for more sophisticated multi-agent architectures
 
 
 ## Node Types
