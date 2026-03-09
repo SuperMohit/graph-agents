@@ -254,6 +254,84 @@ class Log:
         )
 
 
+class RunStatus(str, Enum):
+    """Status of an individual agent run."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TOOL_CALLING = "tool_calling"
+
+
+@dataclass
+class AgentRun:
+    """Record of a single agent execution within a workflow."""
+
+    id: str
+    agent_id: str
+    workflow_id: str
+    status: str = RunStatus.PENDING.value
+    input: dict[str, Any] = field(default_factory=dict)
+    output: dict[str, Any] = field(default_factory=dict)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
+    duration_ms: float = 0.0
+    start_time: datetime = field(default_factory=datetime.utcnow)
+    end_time: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "agent_id": self.agent_id,
+            "workflow_id": self.workflow_id,
+            "status": self.status,
+            "input": json.dumps(self.input),
+            "output": json.dumps(self.output),
+            "tool_calls": json.dumps(self.tool_calls),
+            "messages": json.dumps(self.messages),
+            "error": self.error,
+            "duration_ms": self.duration_ms,
+            "start_time": self.start_time.isoformat(),
+            "end_time": self.end_time.isoformat() if self.end_time else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AgentRun:
+        def _parse_json(val: Any, default: Any) -> Any:
+            if isinstance(val, str):
+                try:
+                    return json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    return default
+            return val if val is not None else default
+
+        start_time = data.get("start_time")
+        if isinstance(start_time, str):
+            start_time = datetime.fromisoformat(start_time)
+        elif not isinstance(start_time, datetime):
+            start_time = datetime.utcnow()
+        end_time = data.get("end_time")
+        if isinstance(end_time, str):
+            end_time = datetime.fromisoformat(end_time)
+
+        return cls(
+            id=data["id"],
+            agent_id=data["agent_id"],
+            workflow_id=data["workflow_id"],
+            status=data.get("status", RunStatus.PENDING.value),
+            input=_parse_json(data.get("input"), {}),
+            output=_parse_json(data.get("output"), {}),
+            tool_calls=_parse_json(data.get("tool_calls"), []),
+            messages=_parse_json(data.get("messages"), []),
+            error=data.get("error"),
+            duration_ms=data.get("duration_ms", 0.0),
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+
 @dataclass
 class WorkflowExecution:
     """Represents a workflow run through the agent system."""

@@ -18,19 +18,24 @@ Rather than stitching together fragmented libraries, NexusAgents co-locates ever
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     NexusAgents                         │
-│                   (Facade / Entry Point)                │
-├──────────┬──────────┬──────────┬──────────┬─────────────┤
-│  Agent   │   Tool   │  Memory  │   Log    │Relationship │
-│  Manager │  Manager │  Manager │  Manager │  Manager    │
-├──────────┴──────────┴──────────┴──────────┴─────────────┤
-│                     Orchestrator                        │
-│            (Workflow Execution Engine)                   │
-├─────────────────────────────────────────────────────────┤
-│                      NexusCore                          │
-│              (Neo4j Driver + Schema)                    │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                       NexusAgents                           │
+│                     (Facade / Entry Point)                  │
+├─────────────────────────────────────────────────────────────┤
+│  AgentManager  ToolManager  MemoryManager  LogManager  ...  │
+├──────────────────────┬──────────────────────────────────────┤
+│     Orchestrator     │         ToolRegistry                 │
+│  (Workflow Engine)   │  (name → Python callable)            │
+├──────────────────────┼──────────────────────────────────────┤
+│                  AgentRunner                                │
+│    (LLM calls + tool-use loop + memory injection)           │
+├─────────────────────────────────────────────────────────────┤
+│                    LLMProvider                              │
+│   (AnthropicProvider or any Protocol-compatible impl)       │
+├─────────────────────────────────────────────────────────────┤
+│                      NexusCore                              │
+│                (Neo4j Driver + Schema)                      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Graph Schema
@@ -39,10 +44,11 @@ Rather than stitching together fragmented libraries, NexusAgents co-locates ever
 
 | Node | Key Properties |
 |------|---------------|
-| **Agent** | `id`, `name`, `type`, `status`, `config` |
-| **Tool** | `id`, `name`, `type`, `description`, `function`, `config` |
+| **Agent** | `id`, `name`, `type`, `status`, `config` (model, system_prompt, temperature, ...) |
+| **Tool** | `id`, `name`, `type`, `description`, `config` (input_schema, ...) |
 | **Memory** | `id`, `key`, `value`, `memory_type`, `priority`, `expiration` |
 | **Log** | `id`, `message`, `level`, `details`, `timestamp` |
+| **AgentRun** | `id`, `agent_id`, `workflow_id`, `status`, `input`, `output`, `tool_calls`, `duration_ms` |
 
 ### Relationships
 
@@ -63,98 +69,179 @@ Log    ─[CONTRIBUTES_TO]───→ Memory   (with weight)
 
 ```bash
 pip install -e .
+
+# With Anthropic LLM support
+pip install -e ".[anthropic]"
 ```
 
 **Requirements:** Python 3.10+ and a running [Neo4j](https://neo4j.com/) instance (5.x+).
 
 ## Quick Start
 
+### Full execution with LLM
+
+Agents are defined in the graph with their config (model, system prompt, etc.). Tools are registered as Python callables. The orchestrator walks the graph, calls the LLM at each agent, executes tools, and passes output forward.
+
 ```python
-from nexus_agents import NexusAgents, AgentType, MemoryType, LogLevel
+from nexus_agents import NexusAgents, AgentType, MemoryType
+from nexus_agents.providers import AnthropicProvider
 
-# Connect and initialize the schema
-with NexusAgents(uri="bolt://localhost:7687", username="neo4j", password="password") as nexus:
-    nexus.initialize()
+# 1. Connect with an LLM provider
+nexus = NexusAgents(
+    uri="bolt://localhost:7687",
+    username="neo4j",
+    password="password",
+    llm=AnthropicProvider(api_key="sk-ant-..."),
+)
+nexus.initialize()
 
-    # --- Create agents ---
-    planner_id  = nexus.agent_manager.create_agent("Planner",  AgentType.PLANNER)
-    executor_id = nexus.agent_manager.create_agent("Executor", AgentType.EXECUTOR)
-    critic_id   = nexus.agent_manager.create_agent("Critic",   AgentType.CRITIC)
+# 2. Create agents with LLM config stored in the graph
+planner_id = nexus.agent_manager.create_agent("Planner", AgentType.PLANNER, {
+    "model": "claude-sonnet-4-20250514",
+    "system_prompt": "You are a planning agent. Break tasks into steps.",
+    "temperature": 0.7,
+})
+executor_id = nexus.agent_manager.create_agent("Executor", AgentType.EXECUTOR, {
+    "model": "claude-sonnet-4-20250514",
+    "system_prompt": "You execute plans. Use tools when needed.",
+})
 
-    # --- Wire them into a pipeline ---
-    nexus.relationship_manager.create_relationship(
-        planner_id, "Agent", executor_id, "Agent", "TRANSITIONS_TO"
-    )
-    nexus.relationship_manager.create_relationship(
-        executor_id, "Agent", critic_id, "Agent", "TRANSITIONS_TO"
-    )
+# 3. Wire agents into a pipeline
+nexus.relationship_manager.create_relationship(
+    planner_id, "Agent", executor_id, "Agent", "TRANSITIONS_TO"
+)
 
-    # --- Attach a tool ---
-    search_id = nexus.tool_manager.create_tool(
-        "WebSearch", "search", "Search the web for information"
-    )
-    nexus.relationship_manager.create_relationship(
-        executor_id, "Agent", search_id, "Tool", "CAN_USE", {"priority": 1}
-    )
+# 4. Register a tool (graph node + Python implementation)
+search_id = nexus.tool_manager.create_tool(
+    "web_search", "search", "Search the web for information",
+    config={
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+    },
+)
+nexus.relationship_manager.create_relationship(
+    executor_id, "Agent", search_id, "Tool", "CAN_USE"
+)
 
-    # --- Store a memory ---
-    nexus.memory_manager.create_memory(
-        key="project_context",
-        value={"goal": "Build a recommendation engine"},
-        memory_type=MemoryType.LONG_TERM,
-        priority=10,
-    )
+# Register the actual Python function
+nexus.tool_registry.register("web_search", lambda inp: {
+    "results": my_search_api(inp["query"])
+})
 
-    # --- Run a workflow ---
-    workflow = nexus.orchestrator.start_workflow(
-        {"task": "Design and build a recommendation engine"},
-        start_agent_id=planner_id,
-    )
-    result = nexus.orchestrator.execute_agent_chain(workflow)
+# 5. Add memory that informs an agent
+mem_id = nexus.memory_manager.create_memory(
+    key="project_goal",
+    value="Build a recommendation engine",
+    memory_type=MemoryType.LONG_TERM,
+    priority=10,
+)
+nexus.relationship_manager.create_relationship(
+    mem_id, "Memory", executor_id, "Agent", "INFORMS"
+)
 
-    print(result)
-    # {
-    #   "workflow_id": "...",
-    #   "status": "completed",
-    #   "steps": [
-    #     {"agent_id": "...", "agent_name": "Planner",  "available_tools": []},
-    #     {"agent_id": "...", "agent_name": "Executor", "available_tools": ["..."]},
-    #     {"agent_id": "...", "agent_name": "Critic",   "available_tools": []},
-    #   ]
-    # }
+# 6. Run the workflow — agents actually execute
+workflow = nexus.orchestrator.start_workflow(
+    {"message": "Design and build a recommendation engine"},
+    start_agent_id=planner_id,
+)
+result = nexus.orchestrator.execute_agent_chain(workflow)
+
+for step in result["steps"]:
+    print(f"{step['agent_name']}: {step['output']['response'][:80]}...")
+    if step.get("tool_calls"):
+        for tc in step["tool_calls"]:
+            print(f"  └─ {tc['name']}({tc['input']}) → {tc['output']}")
+
+nexus.close()
 ```
 
-### Conditional Routing
+### How execution works
+
+```
+                    ┌──────────────┐
+                    │  Orchestrator │
+                    └──────┬───────┘
+                           │ for each agent in TRANSITIONS_TO chain:
+                           ▼
+                    ┌──────────────┐
+                    │  AgentRunner  │
+                    └──────┬───────┘
+                           │ 1. Load agent config from graph
+                           │ 2. Gather memories (INFORMS edges)
+                           │ 3. Gather tools (CAN_USE edges)
+                           │ 4. Call LLM with system prompt + tools
+                           ▼
+              ┌────────────────────────┐
+              │      LLM Provider      │
+              │  (Anthropic, custom)   │
+              └────────────┬───────────┘
+                           │ if stop_reason == "tool_use":
+                           ▼
+              ┌────────────────────────┐
+              │     ToolRegistry       │──→ execute Python callable
+              │ (name → function map) │←── return result to LLM
+              └────────────────────────┘
+                           │ loop until end_turn or max rounds
+                           ▼
+              ┌────────────────────────┐
+              │  AgentRun persisted    │──→ saved as node in Neo4j
+              │  to graph with full    │    (input, output, tool_calls,
+              │  execution trace       │     duration, status, error)
+              └────────────────────────┘
+```
+
+### Conditional routing
 
 Use a **Router** agent to branch execution based on context:
 
 ```python
-router_id   = nexus.agent_manager.create_agent("Router",   AgentType.ROUTER)
-research_id = nexus.agent_manager.create_agent("Research", AgentType.ASSISTANT)
-code_id     = nexus.agent_manager.create_agent("Coder",    AgentType.EXECUTOR)
+router_id   = nexus.agent_manager.create_agent("Router", AgentType.ROUTER, {
+    "system_prompt": "Classify the request as 'research' or 'code'. Respond with just the type.",
+})
+research_id = nexus.agent_manager.create_agent("Researcher", AgentType.ASSISTANT)
+coder_id    = nexus.agent_manager.create_agent("Coder",      AgentType.EXECUTOR)
 
 nexus.relationship_manager.create_relationship(
     router_id, "Agent", research_id, "Agent", "TRANSITIONS_TO",
     {"condition": "type=research"},
 )
 nexus.relationship_manager.create_relationship(
-    router_id, "Agent", code_id, "Agent", "TRANSITIONS_TO",
+    router_id, "Agent", coder_id, "Agent", "TRANSITIONS_TO",
     {"condition": "type=code"},
 )
+```
 
-# The orchestrator evaluates conditions against the result dict
-next_agent = nexus.orchestrator.get_next_agent(router_id, {"type": "research"})
-# → research_id
+### Custom LLM providers
+
+Any object implementing the `LLMProvider` protocol works:
+
+```python
+class MyProvider:
+    def chat(self, messages, model=None, system=None, tools=None,
+             temperature=None, max_tokens=None) -> dict:
+        # Call your LLM and return:
+        return {
+            "content": "response text",        # or list of content blocks
+            "stop_reason": "end_turn",          # or "tool_use"
+            "model": "my-model",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+
+nexus = NexusAgents(uri="...", username="...", password="...", llm=MyProvider())
 ```
 
 ## API Reference
 
 ### NexusAgents (Facade)
 
-| Method | Description |
+| Method / Property | Description |
 |--------|-------------|
 | `initialize()` | Create database constraints and indexes |
 | `close()` | Close the Neo4j connection |
+| `tool_registry` | Access the `ToolRegistry` to register tool implementations |
 
 Exposes: `agent_manager`, `tool_manager`, `memory_manager`, `relationship_manager`, `log_manager`, `orchestrator`.
 
@@ -169,15 +256,18 @@ Exposes: `agent_manager`, `tool_manager`, `memory_manager`, `relationship_manage
 | `list_agents(filters=None)` | List agents with optional filters |
 | `connect_agents(from_id, to_id, rel_type, properties=None)` | Create an inter-agent relationship |
 
-### ToolManager
+### ToolManager + ToolRegistry
 
 | Method | Description |
 |--------|-------------|
-| `create_tool(name, tool_type, description, function="", config=None)` | Create a tool node |
+| **ToolManager** | |
+| `create_tool(name, tool_type, description, config=None)` | Create a tool node in the graph |
 | `get_tool(tool_id)` | Retrieve a tool by ID |
-| `update_tool(tool_id, properties)` | Update tool properties |
-| `delete_tool(tool_id)` | Delete a tool |
 | `list_tools(filters=None)` | List tools with optional filters |
+| **ToolRegistry** | |
+| `register(tool_name, fn)` | Register a Python callable for a tool name |
+| `execute(tool_name, tool_input)` | Execute a registered tool |
+| `build_tool_specs(tools)` | Build Anthropic-style tool specs from Tool models |
 
 ### MemoryManager
 
@@ -185,8 +275,6 @@ Exposes: `agent_manager`, `tool_manager`, `memory_manager`, `relationship_manage
 |--------|-------------|
 | `create_memory(key, value, memory_type, priority=0, expiration=None)` | Store a memory node |
 | `get_memory(memory_id)` | Retrieve a memory by ID |
-| `update_memory(memory_id, properties)` | Update memory properties |
-| `delete_memory(memory_id)` | Delete a memory |
 | `search_memories(query, filters=None)` | Search by key/value content |
 | `connect_memories(from_id, to_id, strength=1.0)` | Link related memories via `REFERENCES` |
 
@@ -198,24 +286,22 @@ Exposes: `agent_manager`, `tool_manager`, `memory_manager`, `relationship_manage
 | `get_logs(filters=None)` | Retrieve logs with optional filters |
 | `search_logs(query)` | Search logs by message content |
 
-### RelationshipManager
-
-| Method | Description |
-|--------|-------------|
-| `create_relationship(from_id, from_type, to_id, to_type, rel_type, properties=None)` | Create any valid relationship |
-| `get_relationship(from_id, to_id, rel_type)` | Get relationship details |
-| `update_relationship(from_id, to_id, rel_type, properties)` | Update relationship properties |
-| `delete_relationship(from_id, to_id, rel_type)` | Remove a relationship |
-| `get_neighbors(node_id, rel_type=None, direction="outgoing")` | Find connected nodes |
-
 ### Orchestrator
 
 | Method | Description |
 |--------|-------------|
 | `start_workflow(input_data, start_agent_id)` | Initialize a workflow execution |
-| `execute_agent_chain(workflow)` | Run agents following `TRANSITIONS_TO` edges |
+| `execute_agent_chain(workflow)` | Run agents following `TRANSITIONS_TO` edges, executing each via `AgentRunner` |
 | `get_next_agent(current_agent_id, result=None)` | Resolve the next agent with condition evaluation |
 | `visualize_workflow(workflow_id)` | Get a text summary of workflow execution |
+
+### AgentRunner
+
+| Method | Description |
+|--------|-------------|
+| `run(agent, tools, input_data, workflow_id, memories=None)` | Execute a single agent to completion (LLM + tool loop) |
+
+Returns an `AgentRun` with: `status`, `output`, `tool_calls`, `messages`, `duration_ms`, `error`.
 
 ## Enums
 
@@ -224,6 +310,7 @@ AgentType:    REASONING | ROUTER | ASSISTANT | PLANNER | EXECUTOR | CRITIC
 MemoryType:   LONG_TERM | SHORT_TERM | CONTEXT | EPISODIC | SEMANTIC
 LogLevel:     DEBUG | INFO | WARNING | ERROR | CRITICAL
 AgentStatus:  IDLE | RUNNING | PAUSED | ERROR | TERMINATED
+RunStatus:    PENDING | RUNNING | COMPLETED | FAILED | TOOL_CALLING
 ```
 
 ## Development
@@ -234,6 +321,8 @@ pip install -e ".[dev]"
 
 # Run tests (no Neo4j instance required — uses in-memory fake graph)
 pytest
+
+# 71 tests covering models, managers, tool registry, runner, and orchestrator
 ```
 
 ## License

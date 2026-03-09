@@ -5,12 +5,14 @@ from datetime import datetime
 
 from nexus_agents.models import (
     Agent,
+    AgentRun,
     AgentStatus,
     AgentType,
     Log,
     LogLevel,
     Memory,
     MemoryType,
+    RunStatus,
     Tool,
     WorkflowExecution,
     WorkflowStatus,
@@ -71,6 +73,51 @@ class TestLog:
         restored = Log.from_dict(d)
         assert restored.level == LogLevel.WARNING
         assert restored.details == {"code": 42}
+
+
+class TestAgentRun:
+    def test_roundtrip(self):
+        run = AgentRun(
+            id="r1",
+            agent_id="a1",
+            workflow_id="w1",
+            status=RunStatus.COMPLETED.value,
+            input={"message": "hello"},
+            output={"response": "world"},
+            tool_calls=[{"name": "search", "input": {}, "output": {"r": 1}, "is_error": False}],
+            messages=[{"role": "user", "content": "hello"}],
+            duration_ms=123.4,
+        )
+        d = run.to_dict()
+        restored = AgentRun.from_dict(d)
+        assert restored.agent_id == "a1"
+        assert restored.workflow_id == "w1"
+        assert restored.status == RunStatus.COMPLETED.value
+        assert restored.input == {"message": "hello"}
+        assert restored.output == {"response": "world"}
+        assert len(restored.tool_calls) == 1
+        assert restored.tool_calls[0]["name"] == "search"
+        assert len(restored.messages) == 1
+        assert restored.duration_ms == 123.4
+
+    def test_from_dict_defaults(self):
+        run = AgentRun.from_dict({"id": "r2", "agent_id": "a2", "workflow_id": "w2"})
+        assert run.status == RunStatus.PENDING.value
+        assert run.input == {}
+        assert run.output == {}
+        assert run.tool_calls == []
+        assert run.error is None
+
+    def test_failed_run(self):
+        run = AgentRun(
+            id="r3", agent_id="a3", workflow_id="w3",
+            status=RunStatus.FAILED.value,
+            error="Connection refused",
+        )
+        d = run.to_dict()
+        restored = AgentRun.from_dict(d)
+        assert restored.status == RunStatus.FAILED.value
+        assert restored.error == "Connection refused"
 
 
 class TestWorkflowExecution:
